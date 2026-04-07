@@ -1,0 +1,494 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// © TJL Tracker V2 — Based on TopG Trading Course
+
+//@version=5
+indicator("TJL Tracker V2", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ===================== INPUTS =====================
+grpStruct  = "Structure Detection"
+lookback   = input.int(30, "Structure Lookback Period", minval=5, maxval=100, group=grpStruct, tooltip="Bars to search for swing high/low before retracement")
+bodyPct    = input.float(5.0, "Zone Body % (wick + X% body)", minval=0.5, maxval=5.0, step=0.5, group=grpStruct)
+
+grpDisplay = "Display Settings"
+showBOS    = input.bool(true, "Show BOS Lines", group=grpDisplay)
+showRR     = input.bool(true, "Show R:R Calculator", group=grpDisplay)
+showTable  = input.bool(true, "Show Multi-TF Table", group=grpDisplay)
+
+grpColors  = "Zone Colors"
+tjl2FreshCol  = input.color(color.new(#f59e0b, 20), "TJL 2/A+ Fresh", group=grpColors)
+tjl2TapCol    = input.color(color.new(#f59e0b, 60), "TJL 2/A+ Tapped", group=grpColors)
+breachedCol   = input.color(color.new(#6b7280, 70), "Breached Zone", group=grpColors)
+bosCol        = input.color(color.new(#a855f7, 40), "BOS Line", group=grpColors)
+
+grpAlert   = "Alerts"
+alertPips  = input.float(10.0, "Alert Distance (pips)", minval=1.0, maxval=100.0, group=grpAlert)
+pipSz      = input.float(0.0001, "Pip Size", minval=0.00001, maxval=1.0, group=grpAlert, tooltip="0.0001 forex, 0.01 JPY, 0.1 gold")
+
+// ===================== TWO-CANDLE RETRACEMENT DETECTION =====================
+// Bullish retracement: 2 consecutive red candles, 2nd closes below 1st low → confirms HIGH before them
+bullRet = close[1] < open[1] and close < open and close < low[1]
+// Bearish retracement: 2 consecutive green candles, 2nd closes above 1st high → confirms LOW before them
+bearRet = close[1] > open[1] and close > open and close > high[1]
+
+// ===================== STRUCTURE TRACKING =====================
+// Find the highest high in last N bars (for confirmed high after bullish retracement)
+getSwingHigh(lb) =>
+    idx = 0
+    val = high[2]
+    for i = 2 to lb + 2
+        if high[i] > val
+            val := high[i]
+            idx := i
+    [val, idx]
+
+// Find the lowest low in last N bars (for confirmed low after bearish retracement)
+getSwingLow(lb) =>
+    idx = 0
+    val = low[2]
+    for i = 2 to lb + 2
+        if low[i] < val
+            val := low[i]
+            idx := i
+    [val, idx]
+
+// Confirmed swing tracking
+var float cHigh = na       // confirmed high price
+var int   cHighBar = na    // bar_index of confirmed high
+var float cHighO = na      // OHLC of the confirmed high candle
+var float cHighC = na
+var float cHighH = na
+var float cHighL = na
+
+var float cLow = na        // confirmed low price
+var int   cLowBar = na
+var float cLowO = na
+var float cLowC = na
+var float cLowH = na
+var float cLowL = na
+
+// Last support / resistance for CHoCH / BOS detection
+var float lastSupport = na
+var float lastResistance = na
+
+// Update confirmed high when bullish retracement detected
+if bullRet
+    [shVal, shIdx] = getSwingHigh(lookback)
+    if na(cHigh) or shVal != cHigh
+        cHigh := shVal
+        cHighBar := bar_index - shIdx
+        cHighO := open[shIdx]
+        cHighC := close[shIdx]
+        cHighH := high[shIdx]
+        cHighL := low[shIdx]
+        lastResistance := shVal
+
+// Update confirmed low when bearish retracement detected
+if bearRet
+    [slVal, slIdx] = getSwingLow(lookback)
+    if na(cLow) or slVal != cLow
+        cLow := slVal
+        cLowBar := bar_index - slIdx
+        cLowO := open[slIdx]
+        cLowC := close[slIdx]
+        cLowH := high[slIdx]
+        cLowL := low[slIdx]
+        lastSupport := slVal
+
+// ===================== BOS DETECTION =====================
+var int bias = 0  // 1=bullish, -1=bearish
+
+bosUp = not na(cHigh) and math.max(close, open) > cHigh and math.max(close[1], open[1]) <= cHigh
+bosDown = not na(cLow) and math.min(close, open) < cLow and math.min(close[1], open[1]) >= cLow
+
+if bosUp
+    bias := 1
+if bosDown
+    bias := -1
+
+// ===================== ZONE CALCULATION =====================
+// Wick + X% body from top (for sell-side TJL1, buy-side TJL2 at swing high)
+zoneTop(cO, cC, cH, pct) =>
+    bTop = math.max(cO, cC)
+    bSz = math.abs(cC - cO)
+    [cH, bTop - bSz * pct / 100.0]
+
+// Wick + X% body from bottom (for buy-side TJL1, sell-side TJL2 at swing low)
+zoneBot(cO, cC, cL, pct) =>
+    bBot = math.min(cO, cC)
+    bSz = math.abs(cC - cO)
+    [bBot + bSz * pct / 100.0, cL]
+
+// Find last pullback candle before BOS
+// Bullish BOS: find lowest low between confirmed high bar and BOS bar
+findPullbackBull(chBar) =>
+    bestI = 1
+    bestL = low[1]
+    searchLen = math.min(bar_index - chBar, 50)
+    if searchLen > 1
+        for i = 1 to searchLen
+            if low[i] < bestL
+                bestL := low[i]
+                bestI := i
+    [open[bestI], close[bestI], high[bestI], low[bestI], bar_index - bestI]
+
+// Bearish BOS: find highest high between confirmed low bar and BOS bar
+findPullbackBear(clBar) =>
+    bestI = 1
+    bestH = high[1]
+    searchLen = math.min(bar_index - clBar, 50)
+    if searchLen > 1
+        for i = 1 to searchLen
+            if high[i] > bestH
+                bestH := high[i]
+                bestI := i
+    [open[bestI], close[bestI], high[bestI], low[bestI], bar_index - bestI]
+
+// ===================== ZONE STORAGE (3 sets) =====================
+// Zone data: [top, bottom, leftBar, status, direction, frozenRightBar]
+// Status: 0=pending, 1=tapped, 2=breached
+// Direction: 1=buy, -1=sell
+
+var float[] t2Top = array.new_float(3, na)
+var float[] t2Bot = array.new_float(3, na)
+var int[]   t2Left = array.new_int(3, na)
+var int[]   t2Stat = array.new_int(3, 0)
+var int[]   t2Dir = array.new_int(3, 0)
+var int[]   t2Frozen = array.new_int(3, na)
+
+// Visual objects
+var box[]   t2Box = array.new_box(3, na)
+var label[] t2Lbl = array.new_label(3, na)
+var line[]  bosLn = array.new_line(3, na)
+var label[] bosLb = array.new_label(3, na)
+
+// Shift arrays: move [1]→[2], [0]→[1], clear [0]
+shiftZone(tops, bots, lefts, stats, dirs, frozens, boxes, labels) =>
+    // Delete oldest visuals
+    ob = array.get(boxes, 2)
+    if not na(ob)
+        box.delete(ob)
+    ol = array.get(labels, 2)
+    if not na(ol)
+        label.delete(ol)
+    // Shift
+    for k = 0 to 1
+        j = 2 - k  // j: 2, 1
+        src = j - 1 // src: 1, 0
+        array.set(tops, j, array.get(tops, src))
+        array.set(bots, j, array.get(bots, src))
+        array.set(lefts, j, array.get(lefts, src))
+        array.set(stats, j, array.get(stats, src))
+        array.set(dirs, j, array.get(dirs, src))
+        array.set(frozens, j, array.get(frozens, src))
+        array.set(boxes, j, array.get(boxes, src))
+        array.set(labels, j, array.get(labels, src))
+    // Clear slot 0
+    array.set(tops, 0, na)
+    array.set(bots, 0, na)
+    array.set(lefts, 0, na)
+    array.set(stats, 0, 0)
+    array.set(dirs, 0, 0)
+    array.set(frozens, 0, na)
+    array.set(boxes, 0, na)
+    array.set(labels, 0, na)
+
+shiftBOS() =>
+    ol = array.get(bosLn, 2)
+    if not na(ol)
+        line.delete(ol)
+    olb = array.get(bosLb, 2)
+    if not na(olb)
+        label.delete(olb)
+    array.set(bosLn, 2, array.get(bosLn, 1))
+    array.set(bosLb, 2, array.get(bosLb, 1))
+    array.set(bosLn, 1, array.get(bosLn, 0))
+    array.set(bosLb, 1, array.get(bosLb, 0))
+    array.set(bosLn, 0, na)
+    array.set(bosLb, 0, na)
+
+// ===================== CREATE ZONES ON BOS =====================
+if bosUp and not na(cHighH)
+    // TJL 2: last pullback before BOS → bottom wick + 1% body from bottom
+    [pbO, pbC, pbH, pbL, pbBar] = findPullbackBull(cHighBar)
+    [z2T, z2B] = zoneBot(pbO, pbC, pbL, bodyPct)
+    shiftZone(t2Top, t2Bot, t2Left, t2Stat, t2Dir, t2Frozen, t2Box, t2Lbl)
+    array.set(t2Top, 0, z2T)
+    array.set(t2Bot, 0, z2B)
+    array.set(t2Left, 0, pbBar)
+    array.set(t2Stat, 0, 0)
+    array.set(t2Dir, 0, 1)
+    array.set(t2Frozen, 0, na)
+    b2 = box.new(pbBar, z2T, bar_index, z2B, bgcolor=tjl2FreshCol, border_color=color.new(tjl2FreshCol, 0), border_width=1)
+    array.set(t2Box, 0, b2)
+    l2 = label.new(pbBar + 2, (z2T + z2B) / 2, "TJL 2 A+ | Pending", style=label.style_label_right, color=color.new(color.black, 100), textcolor=color.new(tjl2FreshCol, 0), size=size.tiny)
+    array.set(t2Lbl, 0, l2)
+
+    // BOS line
+    if showBOS
+        shiftBOS()
+        bl = line.new(cHighBar, cHigh, bar_index, cHigh, color=bosCol, style=line.style_dashed, width=1)
+        array.set(bosLn, 0, bl)
+        blbl = label.new(bar_index, cHigh, "BOS ↑", style=label.style_label_down, color=color.new(#a855f7, 85), textcolor=#a855f7, size=size.small)
+        array.set(bosLb, 0, blbl)
+
+    cHigh := na
+
+if bosDown and not na(cLowL)
+    // TJL 2: last pullback before BOS → top wick + 1% body from top
+    [pbO, pbC, pbH, pbL, pbBar] = findPullbackBear(cLowBar)
+    [z2T, z2B] = zoneTop(pbO, pbC, pbH, bodyPct)
+    shiftZone(t2Top, t2Bot, t2Left, t2Stat, t2Dir, t2Frozen, t2Box, t2Lbl)
+    array.set(t2Top, 0, z2T)
+    array.set(t2Bot, 0, z2B)
+    array.set(t2Left, 0, pbBar)
+    array.set(t2Stat, 0, 0)
+    array.set(t2Dir, 0, -1)
+    array.set(t2Frozen, 0, na)
+    b2 = box.new(pbBar, z2T, bar_index, z2B, bgcolor=tjl2FreshCol, border_color=color.new(tjl2FreshCol, 0), border_width=1)
+    array.set(t2Box, 0, b2)
+    l2 = label.new(pbBar + 2, (z2T + z2B) / 2, "TJL 2 A+ | Pending", style=label.style_label_right, color=color.new(color.black, 100), textcolor=color.new(tjl2FreshCol, 0), size=size.tiny)
+    array.set(t2Lbl, 0, l2)
+
+    if showBOS
+        shiftBOS()
+        bl = line.new(cLowBar, cLow, bar_index, cLow, color=bosCol, style=line.style_dashed, width=1)
+        array.set(bosLn, 0, bl)
+        blbl = label.new(bar_index, cLow, "BOS ↓", style=label.style_label_up, color=color.new(#a855f7, 85), textcolor=#a855f7, size=size.small)
+        array.set(bosLb, 0, blbl)
+
+    cLow := na
+
+// ===================== ZONE STATUS UPDATE + BOX MANAGEMENT =====================
+statusStr(s) =>
+    s == 0 ? "Pending" : s == 1 ? "Tapped" : "Breached"
+
+updateAndDrawZone(tops, bots, lefts, stats, dirs, frozens, boxes, labels, isTJL1) =>
+    for i = 0 to 2
+        zt = array.get(tops, i)
+        zb = array.get(bots, i)
+        st = array.get(stats, i)
+        dr = array.get(dirs, i)
+        fr = array.get(frozens, i)
+        bx = array.get(boxes, i)
+        lb = array.get(labels, i)
+
+        if na(zt) or na(zb)
+            continue
+
+        prevSt = st
+
+        // --- Status check ---
+        if st == 0  // Pending
+            // Tapped: price wick enters the zone
+            if low <= zt and high >= zb
+                st := 1
+                array.set(stats, i, 1)
+                array.set(frozens, i, bar_index)
+            // Breached: price closes through the zone without tapping first
+            else if (dr == 1 and close < zb) or (dr == -1 and close > zt)
+                st := 2
+                array.set(stats, i, 2)
+                array.set(frozens, i, bar_index)
+
+        else if st == 1  // Tapped
+            // Breached: price closes through the zone
+            if (dr == 1 and close < zb) or (dr == -1 and close > zt)
+                st := 2
+                array.set(stats, i, 2)
+                array.set(frozens, i, bar_index)
+
+        // --- Update box ---
+        if not na(bx)
+            // Determine right edge
+            rightBar = bar_index
+            if st == 1 or st == 2
+                frozenBar = array.get(frozens, i)
+                if not na(frozenBar)
+                    rightBar := frozenBar
+                box.set_right(bx, rightBar)
+
+            // Only extend pending boxes
+            if st == 0
+                box.set_right(bx, bar_index + 3)
+
+            // Update color based on status
+            newCol = st == 2 ? breachedCol : st == 1 ? tjl2TapCol : tjl2FreshCol
+            box.set_bgcolor(bx, newCol)
+            box.set_border_color(bx, color.new(newCol, 0))
+
+        // --- Update label on status change ---
+        if st != prevSt and not na(lb)
+            prefix = "TJL 2 A+"
+            newCol = st == 2 ? breachedCol : st == 1 ? tjl2TapCol : tjl2FreshCol
+            label.set_text(lb, prefix + " | " + statusStr(st))
+            label.set_textcolor(lb, color.new(newCol, 0))
+
+updateAndDrawZone(t2Top, t2Bot, t2Left, t2Stat, t2Dir, t2Frozen, t2Box, t2Lbl, false)
+
+// ===================== ALERTS =====================
+alertFired = false
+for i = 0 to 2
+    // TJL 2
+    z2t = array.get(t2Top, i)
+    z2b = array.get(t2Bot, i)
+    z2s = array.get(t2Stat, i)
+    z2d = array.get(t2Dir, i)
+    if not na(z2t) and z2s == 0
+        dist = z2d == 1 ? low - z2t : z2b - high
+        if dist >= 0 and dist <= alertPips * pipSz
+            alertFired := true
+
+alertcondition(alertFired, "TJL 2 A+ Approaching", "Price approaching a pending TJL 2 A+ zone!")
+
+// ===================== MULTI-TF BIAS (Full Structure Detection) =====================
+// Compute bias as a non-var series so request.security can evaluate it per TF
+// We track bias changes using a rolling approach
+biasCalc() =>
+    bRet = close[1] < open[1] and close < open and close < low[1]
+    sRet = close[1] > open[1] and close > open and close > high[1]
+    
+    var float ch = na
+    var float cl = na
+    var int b = 0
+    
+    if bRet
+        hv = high[2]
+        for i = 3 to 20
+            if high[i] > hv
+                hv := high[i]
+        ch := hv
+    
+    if sRet
+        lv = low[2]
+        for i = 3 to 20
+            if low[i] < lv
+                lv := low[i]
+        cl := lv
+    
+    if not na(ch) and close > ch
+        b := 1
+        ch := na
+    if not na(cl) and close < cl
+        b := -1
+        cl := na
+    b
+
+currentBias = biasCalc()
+
+// Request bias from each TF explicitly
+bias5m  = request.security(syminfo.tickerid, "5",   biasCalc())
+bias15m = request.security(syminfo.tickerid, "15",  biasCalc())
+bias1h  = request.security(syminfo.tickerid, "60",  biasCalc())
+bias4h  = request.security(syminfo.tickerid, "240", biasCalc())
+bias1d  = request.security(syminfo.tickerid, "D",   biasCalc())
+
+// ===================== MULTI-TF CONFIRMATION SIGNAL =====================
+// Check if 4+ timeframes align with 5M bias
+alignmentCount = 0
+
+if bias5m == 1  // 5M is bullish
+    if bias15m == 1
+        alignmentCount += 1
+    if bias1h == 1
+        alignmentCount += 1
+    if bias4h == 1
+        alignmentCount += 1
+    if bias1d == 1
+        alignmentCount += 1
+else if bias5m == -1  // 5M is bearish
+    if bias15m == -1
+        alignmentCount += 1
+    if bias1h == -1
+        alignmentCount += 1
+    if bias4h == -1
+        alignmentCount += 1
+    if bias1d == -1
+        alignmentCount += 1
+
+// Fire confirmation signal when 4+ TFs align with 5M
+if alignmentCount >= 4 and barstate.islast
+    var label confirmLbl = na
+    if not na(confirmLbl)
+        label.delete(confirmLbl)
+
+    signalText = bias5m == 1 ? "✓ BUY CONFIRM" : "✓ SELL CONFIRM"
+    signalColor = bias5m == 1 ? color.new(#22c55e, 0) : color.new(#ef4444, 0)
+    confirmLbl := label.new(bar_index, close, signalText, style=label.style_label_right, color=color.new(color.black, 100), textcolor=signalColor, size=size.small)
+
+alertcondition(alignmentCount >= 4, "Multi-TF Confirmation", "4+ timeframes aligned - TJL 2 A+ entry signal!")
+
+// ===================== MULTI-TF TABLE =====================
+// Pre-compute current TF zone data for table
+var string curT2Txt = "—"
+var color curT2Col = color.new(#94a3b8, 0)
+
+if barstate.islast
+    zt2 = array.get(t2Top, 0)
+    zb2 = array.get(t2Bot, 0)
+    zs2 = array.get(t2Stat, 0)
+    curT2Txt := "—"
+    curT2Col := color.new(#94a3b8, 0)
+    if not na(zt2)
+        curT2Txt := str.tostring(zb2, format.mintick) + " - " + str.tostring(zt2, format.mintick) + "\n" + statusStr(zs2)
+        curT2Col := zs2 == 0 ? color.new(#f59e0b, 0) : zs2 == 1 ? color.new(#f59e0b, 40) : color.new(#6b7280, 0)
+
+// Helper for bias text and color
+biasToStr(b) =>
+    b == 1 ? "BUY ↑" : b == -1 ? "SELL ↓" : "—"
+
+biasToCol(b) =>
+    b == 1 ? color.new(#22c55e, 0) : b == -1 ? color.new(#ef4444, 0) : color.new(#94a3b8, 0)
+
+if showTable and barstate.islast
+    var table tbl = table.new(position.top_right, 3, 7, bgcolor=color.new(#111827, 10), border_color=color.new(#334155, 0), border_width=1, frame_color=color.new(#334155, 0), frame_width=1)
+
+    hBg = color.new(#1e293b, 0)
+    nBg = color.new(#111827, 0)
+    dimC = color.new(#64748b, 0)
+    brtC = color.new(#e2e8f0, 0)
+    defC = color.new(#94a3b8, 0)
+
+    // Headers
+    table.cell(tbl, 0, 0, "TF",       text_color=defC, text_size=size.small, bgcolor=hBg)
+    table.cell(tbl, 1, 0, "TJL 2 A+", text_color=#f59e0b, text_size=size.small, bgcolor=hBg)
+    table.cell(tbl, 2, 0, "Bias",     text_color=defC, text_size=size.small, bgcolor=hBg)
+
+    // --- Row 1: 5M ---
+    is5m = timeframe.period == "5"
+    table.cell(tbl, 0, 1, "5M",  text_color=is5m ? brtC : dimC, text_size=size.small, bgcolor=is5m ? hBg : nBg)
+    table.cell(tbl, 1, 1, is5m ? curT2Txt : "Switch to 5M", text_color=is5m ? curT2Col : defC, text_size=size.tiny, bgcolor=is5m ? hBg : nBg)
+    table.cell(tbl, 2, 1, biasToStr(bias5m), text_color=biasToCol(bias5m), text_size=size.small, bgcolor=is5m ? hBg : nBg)
+
+    // --- Row 2: 15M ---
+    is15m = timeframe.period == "15"
+    table.cell(tbl, 0, 2, "15M", text_color=is15m ? brtC : dimC, text_size=size.small, bgcolor=is15m ? hBg : nBg)
+    table.cell(tbl, 1, 2, is15m ? curT2Txt : "Switch to 15M", text_color=is15m ? curT2Col : defC, text_size=size.tiny, bgcolor=is15m ? hBg : nBg)
+    table.cell(tbl, 2, 2, biasToStr(bias15m), text_color=biasToCol(bias15m), text_size=size.small, bgcolor=is15m ? hBg : nBg)
+
+    // --- Row 3: 1H ---
+    is1h = timeframe.period == "60"
+    table.cell(tbl, 0, 3, "1H",  text_color=is1h ? brtC : dimC, text_size=size.small, bgcolor=is1h ? hBg : nBg)
+    table.cell(tbl, 1, 3, is1h ? curT2Txt : "Switch to 1H", text_color=is1h ? curT2Col : defC, text_size=size.tiny, bgcolor=is1h ? hBg : nBg)
+    table.cell(tbl, 2, 3, biasToStr(bias1h), text_color=biasToCol(bias1h), text_size=size.small, bgcolor=is1h ? hBg : nBg)
+
+    // --- Row 4: 4H ---
+    is4h = timeframe.period == "240"
+    table.cell(tbl, 0, 4, "4H",  text_color=is4h ? brtC : dimC, text_size=size.small, bgcolor=is4h ? hBg : nBg)
+    table.cell(tbl, 1, 4, is4h ? curT2Txt : "Switch to 4H", text_color=is4h ? curT2Col : defC, text_size=size.tiny, bgcolor=is4h ? hBg : nBg)
+    table.cell(tbl, 2, 4, biasToStr(bias4h), text_color=biasToCol(bias4h), text_size=size.small, bgcolor=is4h ? hBg : nBg)
+
+    // --- Row 5: 1D ---
+    is1d = timeframe.period == "D"
+    table.cell(tbl, 0, 5, "1D",  text_color=is1d ? brtC : dimC, text_size=size.small, bgcolor=is1d ? hBg : nBg)
+    table.cell(tbl, 1, 5, is1d ? curT2Txt : "Switch to 1D", text_color=is1d ? curT2Col : defC, text_size=size.tiny, bgcolor=is1d ? hBg : nBg)
+    table.cell(tbl, 2, 5, biasToStr(bias1d), text_color=biasToCol(bias1d), text_size=size.small, bgcolor=is1d ? hBg : nBg)
+
+    // --- Footer ---
+    curBTxt = currentBias == 1 ? "BULLISH" : currentBias == -1 ? "BEARISH" : "NEUTRAL"
+    curBCol = currentBias == 1 ? color.new(#22c55e, 0) : currentBias == -1 ? color.new(#ef4444, 0) : color.new(#94a3b8, 0)
+    table.cell(tbl, 0, 6, "NOW",  text_color=brtC, text_size=size.small, bgcolor=hBg)
+    table.cell(tbl, 1, 6, str.tostring(close, format.mintick), text_color=brtC, text_size=size.small, bgcolor=hBg)
+    table.cell(tbl, 2, 6, timeframe.period, text_color=dimC, text_size=size.small, bgcolor=hBg)
+
+// ===================== BIAS BACKGROUND =====================
+bgcolor(bias == 1 ? color.new(#22c55e, 96) : bias == -1 ? color.new(#ef4444, 96) : na, title="Bias Background")
